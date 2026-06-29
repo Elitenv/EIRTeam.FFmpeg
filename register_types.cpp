@@ -40,6 +40,7 @@
 
 #include "ffmpeg_video_stream.h"
 #include "video_stream_ffmpeg_loader.h"
+#include "ffmpeg_audio_decoder.h"
 
 Ref<VideoStreamFFMpegLoader> ffmpeg_loader;
 
@@ -84,6 +85,7 @@ void initialize_ffmpeg_module(ModuleInitializationLevel p_level) {
 	GDREGISTER_ABSTRACT_CLASS(VideoStreamFFMpegLoader);
 	GDREGISTER_CLASS(FFmpegVideoStream);
 	GDREGISTER_INTERNAL_CLASS(FFmpegFrame);
+	GDREGISTER_CLASS(FFmpegAudioDecoder);
 	ffmpeg_loader.instantiate();
 #ifdef GDEXTENSION
 	ResourceLoader::get_singleton()->add_resource_format_loader(ffmpeg_loader);

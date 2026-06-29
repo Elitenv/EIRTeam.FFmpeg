@@ -1,0 +1,27 @@
+[configuration]
+
+entry_symbol = "ffmpeg_init"
+compatibility_minimum = 4.1
+
+[libraries]
+windows.debug.x86_64 = "res://extensions/eirteam-ffmpeg/win64/libgdffmpeg.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://extensions/eirteam-ffmpeg/win64/libgdffmpeg.windows.template_release.x86_64.dll"
+linux.debug.x86_64 = "res://extensions/eirteam-ffmpeg/linux64/libgdffmpeg.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "res://extensions/eirteam-ffmpeg/linux64/libgdffmpeg.linux.template_release.x86_64.so"
+
+[dependencies]
+
+windows.x86_64 = 
+    {"res://extensions/eirteam-ffmpeg/win64/avcodec-62.dll": "",
+    "res://extensions/eirteam-ffmpeg/win64/avformat-62.dll": "",
+    "res://extensions/eirteam-ffmpeg/win64/avutil-60.dll": "",
+    "res://extensions/eirteam-ffmpeg/win64/swresample-6.dll": "",
+    "res://extensions/eirteam-ffmpeg/win64/swscale-9.dll": ""}
+
+linux.x86_64 = 
+    {"res://extensions/eirteam-ffmpeg/linux64/libavcodec.so.60": "",
+    "res://extensions/eirteam-ffmpeg/linux64/libavfilter.so.9": "",
+    "res://extensions/eirteam-ffmpeg/linux64/libavformat.so.60": "",
+    "res://extensions/eirteam-ffmpeg/linux64/libavutil.so.58": "",
+    "res://extensions/eirteam-ffmpeg/linux64/libswresample.so.4": "",
+    "res://extensions/eirteam-ffmpeg/linux64/libswscale.so.7": ""}

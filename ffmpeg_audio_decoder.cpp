@@ -81,7 +81,7 @@ Dictionary FFmpegAudioDecoder::decode_to_pcm(const String &p_path) {
 		}
 
 		// 3. 查找最佳音频流
-		AVCodec *decoder = nullptr;
+		const AVCodec *decoder = nullptr;
 		int stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &decoder, 0);
 		if (stream_idx < 0) {
 			UtilityFunctions::printerr("FFmpegAudioDecoder: 未找到音频流");
@@ -109,11 +109,14 @@ Dictionary FFmpegAudioDecoder::decode_to_pcm(const String &p_path) {
 		AVChannelLayout out_ch_layout;
 		av_channel_layout_default(&out_ch_layout, target_channels);
 
-		swr_ctx = swr_alloc_set_opts(nullptr,
+		if (swr_alloc_set_opts2(&swr_ctx,
 				&out_ch_layout, AV_SAMPLE_FMT_S16, target_sample_rate,
 				&codec_ctx->ch_layout, codec_ctx->sample_fmt, codec_ctx->sample_rate,
-				0, nullptr);
-		if (!swr_ctx || swr_init(swr_ctx) < 0) {
+				0, nullptr) < 0 || !swr_ctx) {
+			UtilityFunctions::printerr("FFmpegAudioDecoder: 无法分配重采样器");
+			break;
+		}
+		if (swr_init(swr_ctx) < 0) {
 			UtilityFunctions::printerr("FFmpegAudioDecoder: 无法初始化重采样器");
 			break;
 		}

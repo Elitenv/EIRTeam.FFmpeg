@@ -102,26 +102,53 @@ int64_t VideoDecoder::_stream_seek_callback(void *p_opaque, int64_t p_offset, in
 }
 
 void VideoDecoder::prepare_decoding() {
-	avio_seek(io_context, 0, SEEK_SET);
-	if (!io_context) {
-		const int context_buffer_size = 4096;
-		unsigned char *context_buffer = (unsigned char *)av_malloc(context_buffer_size);
-		io_context = avio_alloc_context(context_buffer, context_buffer_size, 0, this, &VideoDecoder::_read_packet_callback, nullptr, &VideoDecoder::_stream_seek_callback);
+	// Prefer FFmpeg's native file I/O for real filesystem paths: the custom AVIO +
+	// raw "mpegvideo" demuxer combination deadlocks in the demuxer's start-code scan
+	// (av_read_frame returns 0 without consuming input → decode thread spins at 100%
+	// CPU, zero frames produced — the BGA video crawl on raw MPEG-1 videos). ffprobe
+	// with native I/O handles the same files correctly.
+	String file_path = video_file->get_path();
+	bool use_native_io = !file_path.is_empty() && (file_path.contains(":") || file_path.begins_with("/"));
+	if (use_native_io) {
+		format_context = avformat_alloc_context();
+		format_context->flags |= AVFMT_FLAG_GENPTS;
+		format_context->video_codec = forced_video_codec;
+		int native_open_res = avformat_open_input(&format_context, file_path.utf8().get_data(), nullptr, nullptr);
+		if (native_open_res >= 0) {
+			input_opened = true;
+		} else {
+			avformat_free_context(format_context);
+			format_context = nullptr;
+			use_native_io = false;
+		}
 	}
+	if (!use_native_io) {
+		avio_seek(io_context, 0, SEEK_SET);
+		if (!io_context) {
+			const int context_buffer_size = 4096;
+			unsigned char *context_buffer = (unsigned char *)av_malloc(context_buffer_size);
+			io_context = avio_alloc_context(context_buffer, context_buffer_size, 0, this, &VideoDecoder::_read_packet_callback, nullptr, &VideoDecoder::_stream_seek_callback);
+		}
 
-	format_context = avformat_alloc_context();
-	format_context->pb = io_context;
-	format_context->flags |= AVFMT_FLAG_GENPTS;
-	format_context->video_codec = forced_video_codec;
+		format_context = avformat_alloc_context();
+		format_context->pb = io_context;
+		format_context->flags |= AVFMT_FLAG_GENPTS;
+		format_context->video_codec = forced_video_codec;
 
-	int open_input_res = avformat_open_input(&format_context, "dummy", nullptr, nullptr);
-	input_opened = open_input_res >= 0;
-	ERR_FAIL_COND_MSG(!input_opened, vformat("Error opening file or stream: %s", ffmpeg_get_error_message(open_input_res)));
+		int open_input_res = avformat_open_input(&format_context, "dummy", nullptr, nullptr);
+		input_opened = open_input_res >= 0;
+		ERR_FAIL_COND_MSG(!input_opened, vformat("Error opening file or stream: %s", ffmpeg_get_error_message(open_input_res)));
+	}
 
 	AVCodec *codec = nullptr;
 
 	int find_stream_info_result = avformat_find_stream_info(format_context, nullptr);
 	ERR_FAIL_COND_MSG(find_stream_info_result < 0, vformat("Error finding stream info: %s", ffmpeg_get_error_message(find_stream_info_result)));
+
+	// avformat_find_stream_info leaves the file position mid-stream (it reads ahead
+	// to discover stream parameters). Seek back to the beginning before the decode
+	// thread starts reading (standard FFmpeg practice, same as ffprobe does).
+	avio_seek(format_context->pb, 0, SEEK_SET);
 
 	int stream_index = av_find_best_stream(format_context, AVMEDIA_TYPE_VIDEO, -1, -1, (const AVCodec **)&codec, 0);
 
@@ -210,7 +237,13 @@ Error VideoDecoder::recreate_codec_context() {
 
 	ERR_FAIL_COND_V_MSG(param_copy_result < 0, FAILED, vformat("Couldn't copy codec parameters from %s: %s", decoder->name, ffmpeg_get_error_message(param_copy_result)));
 
-	video_codec_context->thread_count = 0;
+	// Single-threaded decode. thread_count=0 (auto) enables frame threading for codecs
+	// that support it (mpeg1video) — and frame-threaded decoders do not propagate the
+	// demuxer-generated packet timestamps to the decoded frames (best_effort_timestamp
+	// and pts are AV_NOPTS_VALUE). All decoded frames then get a garbage huge-negative
+	// frame_time, are discarded by the skip check, no frames ever reach the playback,
+	// EOF fires immediately and the video restarts in a loop — the BGA video crawl.
+	video_codec_context->thread_count = 1;
 
 	int open_codec_result = avcodec_open2(video_codec_context, decoder, nullptr);
 	ERR_FAIL_COND_V_MSG(open_codec_result < 0, FAILED, vformat("Error trying to open %s codec: %s", decoder->name, ffmpeg_get_error_message(open_codec_result)));
@@ -253,6 +286,11 @@ void VideoDecoder::_seek_command(double p_target_timestamp) {
 	skip_output_until_time = p_target_timestamp;
 	decoder_state = DecoderState::READY;
 	skip_current_outputs.clear();
+	if (video_stream && video_stream->avg_frame_rate.num > 0) {
+		video_frame_count = (int)(p_target_timestamp * video_stream->avg_frame_rate.num / (1000.0 * video_stream->avg_frame_rate.den));
+	} else {
+		video_frame_count = 0;
+	}
 }
 
 void VideoDecoder::_thread_func(void *userdata) {
@@ -389,6 +427,15 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 		// use `best_effort_timestamp` as it can be more accurate if timestamps from the source file (pts) are broken.
 		int64_t frame_timestamp = p_received_frame->best_effort_timestamp != AV_NOPTS_VALUE ? p_received_frame->best_effort_timestamp : p_received_frame->pts;
 		double frame_time = (frame_timestamp - video_stream->start_time) * video_time_base_in_seconds * 1000.0;
+		if (frame_timestamp == AV_NOPTS_VALUE || frame_time < 0.0) {
+			// No usable timestamp (raw MPEG-1 demuxed packets carry no pts and the decoder
+			// may produce a garbage best_effort_timestamp). Fall back to a frame counter at
+			// the stream's average frame rate so frames are not discarded by the skip check.
+			int fps_den = video_stream->avg_frame_rate.den > 0 ? video_stream->avg_frame_rate.den : 1;
+			int fps_num = video_stream->avg_frame_rate.num > 0 ? video_stream->avg_frame_rate.num : 25;
+			frame_time = (double)video_frame_count * 1000.0 * fps_den / fps_num;
+			video_frame_count++;
+		}
 
 		if (skip_output_until_time > frame_time || skip_current_outputs.is_set()) {
 			continue;

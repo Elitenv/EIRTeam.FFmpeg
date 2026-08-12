@@ -1,4 +1,4 @@
-/**************************************************************************/
+﻿/**************************************************************************/
 /*  ffmpeg_video_stream.cpp                                               */
 /**************************************************************************/
 /*                         This file is part of:                          */
@@ -142,10 +142,17 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 	playback_position += p_delta * 1000.0f;
 
 	if (decoder->get_decoder_state() == VideoDecoder::DecoderState::END_OF_STREAM && available_frames.size() == 0) {
-		// if at the end of the stream but our playback enters a valid time region again, a seek operation is required to get the decoder back on track.
 		if (playback_position < decoder->get_last_decoded_frame_time()) {
-			seek_into_sync();
+			// The decode thread finished ahead of real-time playback (short videos decode
+			// in milliseconds). The remaining frames are still in the decoder's queue and
+			// drain through get_decoded_frames() as playback_position advances — just wait.
+			// Do NOT seek here (the old seek-into-sync caused a seek/re-decode storm: the
+			// thread hits EOF again within ms and the main thread stalls on the synchronous
+			// seek — 100% CPU spin, frames discarded, BGA video crawl) and do NOT stop
+			// (the node-level loop would restart immediately — the same storm).
 		} else {
+			// Genuine end of stream: freeze on the last frame (non-looping) or let the
+			// node-level loop restart the video from 0.
 			playing = false;
 		}
 	}

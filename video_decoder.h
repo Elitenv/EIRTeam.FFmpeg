@@ -155,6 +155,7 @@ private:
 	double skip_output_until_time = -1.0;
 	SafeFlag skip_current_outputs;
 	SafeNumeric<float> last_decoded_frame_time;
+	int video_frame_count = 0; // fallback frame counter for streams without timestamps (raw MPEG-1)
 	Ref<FileAccess> video_file;
 	BitField<HardwareVideoDecoder> target_hw_video_decoders = HardwareVideoDecoder::ANY;
 	Ref<core_bind::Mutex> available_textures_mutex;

@@ -39,7 +39,10 @@ ffmpeg_install_action = ffmpeg_download.ffmpeg_install(env_ffmpeg, "#bin", ffmpe
 env_ffmpeg.GLSL_HEADER("yuv_to_rgb.glsl")
 env_ffmpeg.Depends(Glob("*.glsl.gen.h"), ["#glsl_builders.py"])
 
-# env_ffmpeg.Append(CPPDEFINES=["FFMPEG_MT_GPU_UPLOAD"])
+# 多线程 GPU 上传（解码线程侧直接产出 ImageTexture，主线程只换纹理）。
+# 2026-10-04 打开：原路径每帧在主线程 set_plane_image(Y/U/V) + 计算着色器转换，
+# 1280x720@60 实测只有 20fps，而 512x512@30 有 600fps ⇒ 成本按像素、与编码无关。
+env_ffmpeg.Append(CPPDEFINES=["FFMPEG_MT_GPU_UPLOAD"])
 if ARGUMENTS.get("ffmpeg_shared", "no") == "yes":
     # Shared lib compilation
     env_ffmpeg.Append(CCFLAGS=["-fPIC"])

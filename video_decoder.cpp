@@ -237,13 +237,15 @@ Error VideoDecoder::recreate_codec_context() {
 
 	ERR_FAIL_COND_V_MSG(param_copy_result < 0, FAILED, vformat("Couldn't copy codec parameters from %s: %s", decoder->name, ffmpeg_get_error_message(param_copy_result)));
 
-	// Single-threaded decode. thread_count=0 (auto) enables frame threading for codecs
-	// that support it (mpeg1video) — and frame-threaded decoders do not propagate the
-	// demuxer-generated packet timestamps to the decoded frames (best_effort_timestamp
-	// and pts are AV_NOPTS_VALUE). All decoded frames then get a garbage huge-negative
-	// frame_time, are discarded by the skip check, no frames ever reach the playback,
-	// EOF fires immediately and the video restarts in a loop — the BGA video crawl.
-	video_codec_context->thread_count = 1;
+	// 多线程解码：**切片线程**（FF_THREAD_SLICE）+ 自动核数。
+	// 背景（七补27）：帧线程（FRAME）不把 demuxer 的 packet 时间戳传给解码帧
+	// （best_effort_timestamp / pts = AV_NOPTS_VALUE）→ 帧被 skip 检查判为垃圾时间丢弃、
+	// 一帧都到不了播放层、立刻 EOF 循环重开 = 「BGA 视频爬行」。当时的权宜是 thread_count=1
+	// （单线程），但那把 H.264 720p 压到 ~20fps（2026-10-04 实机实证：catricious 的 01.mp4）。
+	// 切片线程在一个帧内部并行、时间戳仍来自 packet 本身 → 既避开帧线程的时间戳坑，又拿到多核
+	// 加速；不支持切片的解码器由 ffmpeg 自动退化为单线程（thread_count=0 = auto）。
+	video_codec_context->thread_type = FF_THREAD_SLICE;
+	video_codec_context->thread_count = 0;
 
 	int open_codec_result = avcodec_open2(video_codec_context, decoder, nullptr);
 	ERR_FAIL_COND_V_MSG(open_codec_result < 0, FAILED, vformat("Error trying to open %s codec: %s", decoder->name, ffmpeg_get_error_message(open_codec_result)));

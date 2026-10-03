@@ -102,15 +102,33 @@ class FFmpegVideoStreamPlayback : public VideoStreamPlayback {
 	List<Ref<DecodedFrame>> available_frames;
 	List<Ref<DecodedAudioFrame>> available_audio_frames;
 	Ref<DecodedFrame> last_frame;
-#ifndef FFMPEG_MT_GPU_UPLOAD
+	// 上游用 `#ifndef FFMPEG_MT_GPU_UPLOAD` 包这个成员，但 .cpp 是在 `#ifdef` 分支里用它
+	// （赋值 / get_texture_internal 返回 / clear() 里 unref）→ 打开宏时成员未声明 = 编译失败。
+	// 两种配置都声明，行为不变（2026-10-04 修正）。
 	Ref<ImageTexture> last_frame_texture;
-#endif
 	Ref<Image> last_frame_image;
 	Ref<ImageTexture> texture;
 	Ref<Texture2DRD> yuv_texture;
 	bool looping = false;
 	bool buffering = false;
 	int frames_processed = 0;
+	// ===== BGA 视频性能插桩（debug/ffmpeg_bga_prof=true 时每 120 次 update 打一行分段耗时）=====
+	mutable bool prof_enabled = false;
+	mutable int prof_calls = 0;
+	mutable int prof_texq_calls = 0;
+	mutable uint64_t prof_texq_acc = 0;
+	mutable uint64_t prof_gap_acc = 0;
+	mutable int prof_play_calls = 0;
+	mutable int prof_seek_calls = 0;
+	mutable int prof_stop_calls = 0;
+	mutable uint64_t prof_play_acc = 0;
+	mutable uint64_t prof_seek_acc = 0;
+	mutable uint64_t prof_last_end = 0;
+	mutable double prof_delta_last = 0.0;
+	int prof_accepted = 0;
+	int prof_refilled = 0;
+	uint64_t prof_total_acc = 0;
+	uint64_t prof_acc[6] = { 0, 0, 0, 0, 0, 0 };
 	void seek_into_sync();
 	double get_current_frame_time();
 	bool check_next_frame_valid(Ref<DecodedFrame> p_decoded_frame);

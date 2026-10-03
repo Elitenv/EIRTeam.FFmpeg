@@ -156,6 +156,18 @@ private:
 	SafeFlag skip_current_outputs;
 	SafeNumeric<float> last_decoded_frame_time;
 	int video_frame_count = 0; // fallback frame counter for streams without timestamps (raw MPEG-1)
+	// ===== 解码线程插桩（debug/ffmpeg_bga_prof=true 时每 2s 打一行）=====
+	bool prof_enabled = false;
+	int p_read_ok = 0;
+	int p_read_eof = 0;
+	int p_read_eagain = 0;
+	int p_read_err = 0;
+	int p_recv = 0;
+	int p_skip = 0;
+	int p_push = 0;
+	double p_last_time = 0.0;
+	double p_start_time = 0.0;
+	uint64_t p_last_print_us = 0;
 	Ref<FileAccess> video_file;
 	BitField<HardwareVideoDecoder> target_hw_video_decoders = HardwareVideoDecoder::ANY;
 	Ref<core_bind::Mutex> available_textures_mutex;

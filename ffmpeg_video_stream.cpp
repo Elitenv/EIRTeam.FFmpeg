@@ -1,4 +1,4 @@
-﻿/**************************************************************************/
+/**************************************************************************/
 /*  ffmpeg_video_stream.cpp                                               */
 /**************************************************************************/
 /*                         This file is part of:                          */
@@ -33,6 +33,8 @@
 
 #ifdef GDEXTENSION
 #include "gdextension_build/gdex_print.h"
+#include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/classes/time.hpp>
 #include <godot_cpp/classes/rd_shader_file.hpp>
 #include <godot_cpp/classes/rd_shader_source.hpp>
 #include <godot_cpp/classes/rd_shader_spirv.hpp>
@@ -138,6 +140,13 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 	if (paused || !playing) {
 		return;
 	}
+	uint64_t pt0 = prof_enabled ? Time::get_singleton()->get_ticks_usec() : 0;
+	if (prof_enabled) {
+		if (prof_last_end != 0) {
+			prof_gap_acc += pt0 - prof_last_end;
+		}
+		prof_delta_last = p_delta;
+	}
 
 	playback_position += p_delta * 1000.0f;
 
@@ -150,6 +159,13 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 			// thread hits EOF again within ms and the main thread stalls on the synchronous
 			// seek — 100% CPU spin, frames discarded, BGA video crawl) and do NOT stop
 			// (the node-level loop would restart immediately — the same storm).
+		} else if (decoder->get_last_decoded_frame_time() <= 0.0) {
+			// ⚠️ 一帧都还没解出来（首帧 / seek 之后立刻报 EOF）：**绝不能**报 playing=false。
+			// 引擎（VideoStreamPlayer）看到 !is_playing() 会每帧调用 play() → 我们这边
+			// play_internal() 里那次**同步** seek(0,true) 会阻塞主线程 ~47ms/帧，而解码线程每帧
+			// 都被 seek 打断 → 永远解不出第一帧 → 自持的 seek 风暴（2026-10-04 实机插桩实证：
+			// play=120/47.33ms per 120 updates、accepted=0、pos=0、整帧 50ms = 20fps）。
+			// 保持 playing=true，让解码线程跑出第一帧。
 		} else {
 			// Genuine end of stream: freeze on the last frame (non-looping) or let the
 			// node-level loop restart the video from 0.
@@ -173,6 +189,7 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		print_line(vformat("Video too far out of sync (%.2f), seeking to %.2f", peek_frame->get_time(), playback_position));
 		seek_into_sync();
 	}
+	uint64_t pt1 = prof_enabled ? Time::get_singleton()->get_ticks_usec() : 0;
 
 	double frame_time = get_current_frame_time();
 
@@ -196,6 +213,7 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		next_frame = next_frame->next();
 		available_frames.pop_front();
 	}
+	uint64_t pt2 = prof_enabled ? Time::get_singleton()->get_ticks_usec() : 0;
 #ifndef FFMPEG_MT_GPU_UPLOAD
 	if (got_new_frame) {
 		// YUV conversion
@@ -226,12 +244,16 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 		}
 	}
 #endif
+	uint64_t pt3 = prof_enabled ? Time::get_singleton()->get_ticks_usec() : 0;
 
+	int refilled = 0;
 	if (available_frames.size() == 0) {
 		for (Ref<DecodedFrame> frame : decoder->get_decoded_frames()) {
 			available_frames.push_back(frame);
+			refilled++;
 		}
 	}
+	uint64_t pt4 = prof_enabled ? Time::get_singleton()->get_ticks_usec() : 0;
 
 	Ref<DecodedAudioFrame> peek_audio_frame;
 	if (available_audio_frames.size() > 0) {
@@ -271,15 +293,67 @@ void FFmpegVideoStreamPlayback::update_internal(double p_delta) {
 			available_audio_frames.push_back(frame);
 		}
 	}
+	uint64_t pt5 = prof_enabled ? Time::get_singleton()->get_ticks_usec() : 0;
 
 	buffering = decoder->is_running() && available_frames.size() == 0;
 
 	if (frame_time != get_current_frame_time()) {
 		frames_processed++;
 	}
+
+	if (prof_enabled) {
+		uint64_t pt6 = Time::get_singleton()->get_ticks_usec();
+		prof_last_end = pt6;
+		prof_calls++;
+		if (got_new_frame) {
+			prof_accepted++;
+		}
+		prof_refilled += refilled;
+		prof_total_acc += pt6 - pt0;
+		prof_acc[0] += pt1 - pt0;
+		prof_acc[1] += pt2 - pt1;
+		prof_acc[2] += pt3 - pt2;
+		prof_acc[3] += pt4 - pt3;
+		prof_acc[4] += pt5 - pt4;
+		prof_acc[5] += pt6 - pt5;
+		if (prof_calls >= 120) {
+			double inv = 1.0 / double(prof_calls);
+			double total_ms = double(prof_total_acc) * inv / 1000.0;
+			print_line(vformat("[ffmpeg-prof] calls=%d total=%.2fms gap=%.2fms delta=%.4f head=%.2f drain=%.2f yuv=%.2f refill=%.2f audio=%.2f tail=%.2f texq=%.2fms/%d play=%d/%.2fms seek=%d/%.2fms stop=%d | accepted=%d refilled=%d avail=%d pos=%.0f lastf=%.0f",
+					prof_calls, total_ms, double(prof_gap_acc) * inv / 1000.0, prof_delta_last, double(prof_acc[0]) * inv / 1000.0, double(prof_acc[1]) * inv / 1000.0,
+					double(prof_acc[2]) * inv / 1000.0, double(prof_acc[3]) * inv / 1000.0,
+					double(prof_acc[4]) * inv / 1000.0, double(prof_acc[5]) * inv / 1000.0,
+						double(prof_texq_acc) * inv / 1000.0, prof_texq_calls,
+					prof_play_calls, double(prof_play_acc) * inv / 1000.0, prof_seek_calls, double(prof_seek_acc) * inv / 1000.0, prof_stop_calls,
+					prof_accepted, prof_refilled, available_frames.size(), playback_position, decoder->get_last_decoded_frame_time()));
+			prof_calls = 0;
+			prof_accepted = 0;
+			prof_refilled = 0;
+			prof_total_acc = 0;
+			prof_texq_calls = 0;
+			prof_texq_acc = 0;
+			prof_gap_acc = 0;
+			prof_play_calls = 0;
+			prof_play_acc = 0;
+			prof_seek_calls = 0;
+			prof_seek_acc = 0;
+			prof_stop_calls = 0;
+			for (int i = 0; i < 6; i++) {
+				prof_acc[i] = 0;
+			}
+		}
+	}
 }
 
 Error FFmpegVideoStreamPlayback::load(Ref<FileAccess> p_file_access) {
+	prof_enabled = bool(ProjectSettings::get_singleton()->get_setting("debug/ffmpeg_bga_prof", false));
+	prof_calls = 0;
+	prof_accepted = 0;
+	prof_refilled = 0;
+	prof_total_acc = 0;
+	for (int i = 0; i < 6; i++) {
+		prof_acc[i] = 0;
+	}
 	decoder = Ref<VideoDecoder>(memnew(VideoDecoder(p_file_access)));
 
 	decoder->start_decoding();
@@ -315,18 +389,28 @@ void FFmpegVideoStreamPlayback::set_paused_internal(bool p_paused) {
 }
 
 void FFmpegVideoStreamPlayback::play_internal() {
+	uint64_t pl0 = prof_enabled ? Time::get_singleton()->get_ticks_usec() : 0;
+	prof_play_calls++;
 	if (decoder->get_decoder_state() == VideoDecoder::FAULTED) {
 		playing = false;
 		return;
 	}
 	clear();
 	playback_position = 0;
-	decoder->seek(0, true);
+	// 只在解码线程**尚未产出任何帧**时才做这次同步 seek（它是阻塞主线程的）：
+	// 若已经解出过帧（例如引擎重复调用 play()），再 seek(0,true) 会白等一次完整 seek。
+	if (!decoder->is_running() || decoder->get_last_decoded_frame_time() <= 0.0) {
+		decoder->seek(0, true);
+	}
 	just_seeked = true;
 	playing = true;
+	if (prof_enabled) {
+		prof_play_acc += Time::get_singleton()->get_ticks_usec() - pl0;
+	}
 }
 
 void FFmpegVideoStreamPlayback::stop_internal() {
+	prof_stop_calls++;
 	if (playing) {
 		clear();
 		playback_position = 0.0f;
@@ -341,11 +425,16 @@ void FFmpegVideoStreamPlayback::stop_internal() {
 }
 
 void FFmpegVideoStreamPlayback::seek_internal(double p_time) {
+	uint64_t sk0 = prof_enabled ? Time::get_singleton()->get_ticks_usec() : 0;
+	prof_seek_calls++;
 	decoder->seek(p_time * 1000.0f);
 	just_seeked = true;
 	available_frames.clear();
 	available_audio_frames.clear();
 	playback_position = p_time * 1000.0f;
+	if (prof_enabled) {
+		prof_seek_acc += Time::get_singleton()->get_ticks_usec() - sk0;
+	}
 }
 
 double FFmpegVideoStreamPlayback::get_length_internal() const {
@@ -353,14 +442,24 @@ double FFmpegVideoStreamPlayback::get_length_internal() const {
 }
 
 Ref<Texture2D> FFmpegVideoStreamPlayback::get_texture_internal() const {
+	// ⚠️ 引擎**每帧**都调用这里取纹理；YUV 路径里 get_output_texture() 会走 _ensure_output_texture()
+	// （RD 调用）——它不在 update_internal 里，必须单独计时，否则会把开销算漏（2026-10-04）。
+	uint64_t q0 = prof_enabled ? Time::get_singleton()->get_ticks_usec() : 0;
+	Ref<Texture2D> ret;
 #ifdef FFMPEG_MT_GPU_UPLOAD
-	return last_frame_texture;
+	ret = last_frame_texture;
 #else
 	if (yuv_converter.is_valid()) {
-		return yuv_converter->get_output_texture();
+		ret = yuv_converter->get_output_texture();
+	} else {
+		ret = texture;
 	}
-	return texture;
 #endif
+	if (prof_enabled) {
+		prof_texq_calls++;
+		prof_texq_acc += Time::get_singleton()->get_ticks_usec() - q0;
+	}
+	return ret;
 }
 
 double FFmpegVideoStreamPlayback::get_playback_position_internal() const {

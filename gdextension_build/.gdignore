@@ -1,0 +1,3 @@
+# Godot: 忽略扩展构建目录 —— 构建产物里会再生成一份 ffmpeg.gdextension，
+# 与扩展根目录那份指向同一个 DLL，会导致 ffmpeg_init 被重复调用（类重复注册、
+# FFmpegVideoStream 虚函数失效 → 视频 BGA 无法播放）。2026-10-04 实证。

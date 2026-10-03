@@ -39,7 +39,9 @@
 
 #ifdef GDEXTENSION
 #include "gdextension_build/gdex_print.h"
+#include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/classes/rendering_server.hpp>
+#include <godot_cpp/classes/time.hpp>
 #endif
 
 extern "C" {
@@ -145,10 +147,16 @@ void VideoDecoder::prepare_decoding() {
 	int find_stream_info_result = avformat_find_stream_info(format_context, nullptr);
 	ERR_FAIL_COND_MSG(find_stream_info_result < 0, vformat("Error finding stream info: %s", ffmpeg_get_error_message(find_stream_info_result)));
 
-	// avformat_find_stream_info leaves the file position mid-stream (it reads ahead
-	// to discover stream parameters). Seek back to the beginning before the decode
-	// thread starts reading (standard FFmpeg practice, same as ffprobe does).
-	avio_seek(format_context->pb, 0, SEEK_SET);
+	// avformat_find_stream_info 会读过头（探测流参数），要回到文件开头再让解码线程读。
+	// ⚠️ **原生 I/O 路径下绝不能用裸 pb seek 回 0**：MP4 demuxer 自己维护 sample 表/位置状态，
+	// 裸 seek 会让它以为已经读到文件尾 → av_read_frame 立刻返回 EOF（2026-10-04 实机插桩实证：
+	// 8847 帧的 01.mp4 只 read ok=1 就 eof、整首歌只解出 1 帧）。改用 demuxer 层 seek；
+	// 自定义 AVIO 路径（非原生 I/O）维持原来的裸 seek 行为。
+	if (use_native_io) {
+		avformat_seek_file(format_context, -1, INT64_MIN, 0, INT64_MAX, 0);
+	} else {
+		avio_seek(format_context->pb, 0, SEEK_SET);
+	}
 
 	int stream_index = av_find_best_stream(format_context, AVMEDIA_TYPE_VIDEO, -1, -1, (const AVCodec **)&codec, 0);
 
@@ -332,6 +340,24 @@ void VideoDecoder::_thread_func(void *userdata) {
 			} break;
 		}
 		decoder->decoder_commands.flush_if_pending();
+
+		if (decoder->prof_enabled) {
+			uint64_t now_us = Time::get_singleton()->get_ticks_usec();
+			if (now_us - decoder->p_last_print_us >= 2000000) {
+				decoder->p_last_print_us = now_us;
+				print_line(vformat("[ffmpeg-dec] read ok=%d eof=%d eagain=%d err=%d | recv=%d skip=%d push=%d last_t=%.1f start_time=%.0f state=%d counter=%d",
+						decoder->p_read_ok, decoder->p_read_eof, decoder->p_read_eagain, decoder->p_read_err,
+						decoder->p_recv, decoder->p_skip, decoder->p_push, decoder->p_last_time, decoder->p_start_time,
+						(int)decoder->decoder_state, decoder->video_frame_count));
+				decoder->p_read_ok = 0;
+				decoder->p_read_eof = 0;
+				decoder->p_read_eagain = 0;
+				decoder->p_read_err = 0;
+				decoder->p_recv = 0;
+				decoder->p_skip = 0;
+				decoder->p_push = 0;
+			}
+		}
 	}
 
 	av_packet_free(&packet);
@@ -351,6 +377,7 @@ void VideoDecoder::_decode_next_frame(AVPacket *p_packet, AVFrame *p_receive_fra
 	}
 
 	if (read_frame_result >= 0) {
+		p_read_ok++;
 		decoder_state = DecoderState::RUNNING;
 
 		bool unref_packet = true;
@@ -371,6 +398,7 @@ void VideoDecoder::_decode_next_frame(AVPacket *p_packet, AVFrame *p_receive_fra
 			av_packet_unref(p_packet);
 		}
 	} else if (read_frame_result == AVERROR_EOF) {
+		p_read_eof++;
 		_send_packet(video_codec_context, p_receive_frame, nullptr);
 		if (has_audio) {
 			_send_packet(audio_codec_context, p_receive_frame, nullptr);
@@ -381,9 +409,11 @@ void VideoDecoder::_decode_next_frame(AVPacket *p_packet, AVFrame *p_receive_fra
 			decoder_state = DecoderState::END_OF_STREAM;
 		}
 	} else if (read_frame_result == -EAGAIN) {
+		p_read_eagain++;
 		decoder_state = DecoderState::READY;
 		OS::get_singleton()->delay_usec(1000);
 	} else {
+		p_read_err++;
 		print_line(vformat("Failed to read data into avcodec packet: %s", ffmpeg_get_error_message(read_frame_result)));
 	}
 }
@@ -426,6 +456,7 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 			break;
 		}
 
+		p_recv++;
 		// use `best_effort_timestamp` as it can be more accurate if timestamps from the source file (pts) are broken.
 		int64_t frame_timestamp = p_received_frame->best_effort_timestamp != AV_NOPTS_VALUE ? p_received_frame->best_effort_timestamp : p_received_frame->pts;
 		double frame_time = (frame_timestamp - video_stream->start_time) * video_time_base_in_seconds * 1000.0;
@@ -440,8 +471,12 @@ void VideoDecoder::_read_decoded_frames(AVFrame *p_received_frame) {
 		}
 
 		if (skip_output_until_time > frame_time || skip_current_outputs.is_set()) {
+			p_skip++;
 			continue;
 		}
+		p_push++;
+		p_last_time = frame_time;
+		p_start_time = video_stream ? (double)video_stream->start_time : 0.0;
 
 		Ref<FFmpegFrame> frame;
 		// copy data to a new AVFrame so that `receiveFrame` can be reused.
@@ -836,6 +871,10 @@ VideoDecoder::VideoDecoder(Ref<FileAccess> p_file) {
 	scaler_frames_mutex.instantiate();
 	decoded_frames_mutex.instantiate();
 	audio_buffer_mutex.instantiate();
+	prof_enabled = bool(ProjectSettings::get_singleton()->get_setting("debug/ffmpeg_bga_prof", false));
+	if (prof_enabled) {
+		p_last_print_us = Time::get_singleton()->get_ticks_usec();
+	}
 }
 
 VideoDecoder::~VideoDecoder() {
